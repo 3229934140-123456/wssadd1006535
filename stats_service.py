@@ -12,7 +12,8 @@ from schemas import (
     OverviewRankingItem, PatientAlertHistory, PatientActionHistory,
     HighValueExportResponse, HighValueExportItem,
     TrendResponse, TrendDataPoint,
-    AssigneePerformanceResponse, AssigneePerformanceItem
+    AssigneePerformanceResponse, AssigneePerformanceItem,
+    ClinicAssigneeCrossViewResponse, ClinicAssigneeView, ClinicAssigneeItem,
 )
 from config import (
     HIGH_VALUE_PATIENT_TYPES,
@@ -960,8 +961,9 @@ class StatsService:
                 if alert.auto_resolved:
                     data["auto_resolved_count"] += 1
                     total_auto_resolved += 1
-                if alert.resolved_at and alert.created_at:
-                    delta = alert.resolved_at - alert.created_at
+                if alert.resolved_at:
+                    start_time = alert.assigned_at or alert.created_at
+                    delta = alert.resolved_at - start_time
                     hours = delta.total_seconds() / 3600
                     data["total_resolve_hours"] += hours
                     total_resolve_hours += hours
@@ -982,7 +984,6 @@ class StatsService:
             resolved = data["resolved_count"]
             avg_hours = round(data["total_resolve_hours"] / resolved, 1) if resolved > 0 else 0.0
             auto_rate = round(data["auto_resolved_count"] / resolved * 100, 1) if resolved > 0 else 0.0
-            with_deadline = data["on_time_count"] + (data["overdue_count"] if data["pending_count"] == 0 else max(0, data["overdue_count"] - data["pending_count"]))
             total_with_deadline = data["on_time_count"] + data["overdue_count"]
             on_time_rate = round(data["on_time_count"] / total_with_deadline * 100, 1) if total_with_deadline > 0 else 0.0
             items.append(AssigneePerformanceItem(
@@ -1018,4 +1019,147 @@ class StatsService:
             overall_auto_resolve_rate=overall_auto_rate,
             overall_avg_resolve_hours=overall_avg,
             items=items
+        )
+
+    def get_clinic_assignee_cross_view(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> ClinicAssigneeCrossViewResponse:
+        now = datetime.utcnow()
+        clinics = self.db.query(Clinic).all()
+        total_assigned_all = 0
+        total_resolved_all = 0
+        total_pending_all = 0
+        total_overdue_all = 0
+        total_resolve_hours_all = 0.0
+        total_auto_resolved_all = 0
+        total_on_time_all = 0
+        total_with_deadline_all = 0
+        clinic_views = []
+
+        for clinic in clinics:
+            alerts_query = self.db.query(Alert).filter(
+                Alert.clinic_id == clinic.id,
+                Alert.assignee.isnot(None)
+            )
+            if start_date:
+                alerts_query = alerts_query.filter(Alert.created_at >= datetime.combine(start_date, datetime.min.time()))
+            if end_date:
+                alerts_query = alerts_query.filter(Alert.created_at <= datetime.combine(end_date, datetime.max.time()))
+            alerts = alerts_query.all()
+            if not alerts:
+                continue
+
+            assignee_data = {}
+            clinic_assigned = 0
+            clinic_resolved = 0
+            clinic_pending = 0
+            clinic_overdue = 0
+            clinic_auto_resolved = 0
+            clinic_on_time = 0
+            clinic_resolve_hours = 0.0
+
+            for alert in alerts:
+                assignee = alert.assignee
+                if assignee not in assignee_data:
+                    assignee_data[assignee] = {
+                        "assignee": assignee,
+                        "total_assigned": 0,
+                        "resolved_count": 0,
+                        "pending_count": 0,
+                        "on_time_count": 0,
+                        "overdue_count": 0,
+                        "auto_resolved_count": 0,
+                        "total_resolve_hours": 0.0,
+                    }
+                data = assignee_data[assignee]
+                data["total_assigned"] += 1
+                clinic_assigned += 1
+
+                if alert.status == "已处理":
+                    data["resolved_count"] += 1
+                    clinic_resolved += 1
+                    if alert.auto_resolved:
+                        data["auto_resolved_count"] += 1
+                        clinic_auto_resolved += 1
+                    if alert.resolved_at:
+                        start_time = alert.assigned_at or alert.created_at
+                        delta = alert.resolved_at - start_time
+                        hours = delta.total_seconds() / 3600
+                        data["total_resolve_hours"] += hours
+                        clinic_resolve_hours += hours
+                    if alert.deadline and alert.resolved_at:
+                        if alert.resolved_at <= alert.deadline:
+                            data["on_time_count"] += 1
+                            clinic_on_time += 1
+                        else:
+                            data["overdue_count"] += 1
+                            clinic_overdue += 1
+                else:
+                    data["pending_count"] += 1
+                    clinic_pending += 1
+                    if alert.deadline and now > alert.deadline:
+                        data["overdue_count"] += 1
+                        clinic_overdue += 1
+
+            assignee_items = []
+            for a_name, a_data in assignee_data.items():
+                resolved = a_data["resolved_count"]
+                avg_h = round(a_data["total_resolve_hours"] / resolved, 1) if resolved > 0 else 0.0
+                auto_r = round(a_data["auto_resolved_count"] / resolved * 100, 1) if resolved > 0 else 0.0
+                twd = a_data["on_time_count"] + a_data["overdue_count"]
+                ot_r = round(a_data["on_time_count"] / twd * 100, 1) if twd > 0 else 0.0
+                assignee_items.append(ClinicAssigneeItem(
+                    assignee=a_name,
+                    total_assigned=a_data["total_assigned"],
+                    resolved_count=resolved,
+                    pending_count=a_data["pending_count"],
+                    on_time_count=a_data["on_time_count"],
+                    overdue_count=a_data["overdue_count"],
+                    auto_resolved_count=a_data["auto_resolved_count"],
+                    auto_resolve_rate=auto_r,
+                    on_time_rate=ot_r,
+                    avg_resolve_hours=avg_h,
+                ))
+
+            assignee_items.sort(key=lambda x: x.total_assigned, reverse=True)
+
+            clinic_on_time_rate = round(clinic_on_time / (clinic_on_time + clinic_overdue) * 100, 1) if (clinic_on_time + clinic_overdue) > 0 else 0.0
+            clinic_auto_rate = round(clinic_auto_resolved / clinic_resolved * 100, 1) if clinic_resolved > 0 else 0.0
+
+            clinic_views.append(ClinicAssigneeView(
+                clinic_id=clinic.id,
+                clinic_name=clinic.name,
+                total_assigned=clinic_assigned,
+                total_resolved=clinic_resolved,
+                total_pending=clinic_pending,
+                total_overdue=clinic_overdue,
+                overall_on_time_rate=clinic_on_time_rate,
+                overall_auto_resolve_rate=clinic_auto_rate,
+                assignees=assignee_items,
+            ))
+
+            total_assigned_all += clinic_assigned
+            total_resolved_all += clinic_resolved
+            total_pending_all += clinic_pending
+            total_overdue_all += clinic_overdue
+            total_auto_resolved_all += clinic_auto_resolved
+            total_on_time_all += clinic_on_time
+            total_resolve_hours_all += clinic_resolve_hours
+
+        overall_on_time_rate = round(total_on_time_all / (total_on_time_all + total_overdue_all) * 100, 1) if (total_on_time_all + total_overdue_all) > 0 else 0.0
+        overall_auto_rate = round(total_auto_resolved_all / total_resolved_all * 100, 1) if total_resolved_all > 0 else 0.0
+        overall_avg = round(total_resolve_hours_all / total_resolved_all, 1) if total_resolved_all > 0 else 0.0
+
+        return ClinicAssigneeCrossViewResponse(
+            total_clinics=len(clinic_views),
+            total_assigned=total_assigned_all,
+            total_resolved=total_resolved_all,
+            total_pending=total_pending_all,
+            total_overdue=total_overdue_all,
+            overall_on_time_rate=overall_on_time_rate,
+            overall_auto_resolve_rate=overall_auto_rate,
+            overall_avg_resolve_hours=overall_avg,
+            clinics=clinic_views,
         )

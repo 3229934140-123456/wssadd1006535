@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
-from models import Clinic, Doctor, Patient, CleaningRecord, Followup, Appointment, Alert, ClinicConfig, AlertAction
+from models import Clinic, Doctor, Patient, CleaningRecord, Followup, Appointment, Alert, ClinicConfig, AlertAction, ExportTemplateModel
 from schemas import (
     ClinicCreate, Clinic as ClinicSchema,
     ClinicConfigCreate, ClinicConfigUpdate, ClinicConfig as ClinicConfigSchema,
@@ -19,6 +19,8 @@ from schemas import (
     ClinicStats, CleaningRecordDetail,
     OverviewResponse, PatientAlertHistory, HighValueExportResponse,
     TrendResponse, AssigneePerformanceResponse,
+    ClinicAssigneeCrossViewResponse,
+    ExportTemplateCreate, ExportTemplate, ExportTemplateFilter,
 )
 from alert_engine import AlertEngine
 from stats_service import StatsService
@@ -29,7 +31,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="洁治后流失预警后端服务",
     description="面向连锁口腔机构运营主管的洁治后服务闭环追踪系统",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 
@@ -37,7 +39,7 @@ app = FastAPI(
 def root():
     return {
         "service": "洁治后流失预警后端服务",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "docs": "/docs",
         "features": [
             "预警自动闭环（随访/预约补录自动关闭预警）",
@@ -48,9 +50,11 @@ def root():
             "预警任务分派（分派给客服/医生，设置截止时间）",
             "趋势分析（按天/周统计新增、处理、自动闭环比例，支持门店对比）",
             "处理人/时间明确显示（列表/详情/导出信息统一）",
-            "批量分派（多选预警一次性分给同一负责人）",
-            "负责人绩效统计（分派数、按时完成率、平均处理时长）",
+            "批量分派（仅待处理预警，已闭环返回失败原因）",
+            "负责人绩效统计（分派→完成口径，截止时间口径）",
             "多维度导出（按类型/状态/门店/医生/负责人/时间范围筛选）",
+            "门店×负责人交叉视图（按门店追人）",
+            "导出模板（保存常用导出模板，自动带出筛选条件）",
         ]
     }
 
@@ -546,7 +550,7 @@ def assign_alert(alert_id: int, assign: AlertAssign, db: Session = Depends(get_d
 @app.post("/alerts/batch-assign", response_model=AlertBatchAssignResult, tags=["预警管理"])
 def batch_assign_alerts(assign: AlertBatchAssign, db: Session = Depends(get_db)):
     engine = AlertEngine(db)
-    success_count, failed_count, success_ids, failed_ids = engine.batch_assign_alerts(
+    success_count, failed_count, success_ids, failed_ids, failed_details = engine.batch_assign_alerts(
         alert_ids=assign.alert_ids,
         assignee=assign.assignee,
         deadline=assign.deadline,
@@ -556,7 +560,8 @@ def batch_assign_alerts(assign: AlertBatchAssign, db: Session = Depends(get_db))
         success_count=success_count,
         failed_count=failed_count,
         success_ids=success_ids,
-        failed_ids=failed_ids
+        failed_ids=failed_ids,
+        failed_details=failed_details
     )
 
 
@@ -585,6 +590,19 @@ def get_assignee_performance(
     stats = StatsService(db)
     return stats.get_assignee_performance(
         clinic_id=clinic_id,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+
+@app.get("/stats/clinic-assignee-cross-view", response_model=ClinicAssigneeCrossViewResponse, tags=["运营统计"])
+def get_clinic_assignee_cross_view(
+    start_date: Optional[date] = Query(None, description="开始日期"),
+    end_date: Optional[date] = Query(None, description="结束日期"),
+    db: Session = Depends(get_db)
+):
+    stats = StatsService(db)
+    return stats.get_clinic_assignee_cross_view(
         start_date=start_date,
         end_date=end_date
     )
@@ -678,3 +696,84 @@ def get_cleaning_record_detail(record_id: int, db: Session = Depends(get_db)):
     if not detail:
         raise HTTPException(status_code=404, detail="记录不存在")
     return detail
+
+
+def _template_model_to_schema(t: ExportTemplateModel) -> ExportTemplate:
+    return ExportTemplate(
+        id=t.id,
+        name=t.name,
+        description=t.description,
+        filters=ExportTemplateFilter(
+            clinic_id=t.filter_clinic_id,
+            alert_type=t.filter_alert_type,
+            status=t.filter_status,
+            doctor_id=t.filter_doctor_id,
+            assignee=t.filter_assignee,
+            patient_type=t.filter_patient_type,
+            start_date=t.filter_start_date,
+            end_date=t.filter_end_date,
+        ),
+        created_at=t.created_at,
+    )
+
+
+@app.get("/export-templates/", response_model=List[ExportTemplate], tags=["导出模板"])
+def list_export_templates(db: Session = Depends(get_db)):
+    templates = db.query(ExportTemplateModel).order_by(ExportTemplateModel.created_at.desc()).all()
+    return [_template_model_to_schema(t) for t in templates]
+
+
+@app.post("/export-templates/", response_model=ExportTemplate, tags=["导出模板"])
+def create_export_template(template: ExportTemplateCreate, db: Session = Depends(get_db)):
+    t = ExportTemplateModel(
+        name=template.name,
+        description=template.description,
+        filter_clinic_id=template.filters.clinic_id,
+        filter_alert_type=template.filters.alert_type,
+        filter_status=template.filters.status,
+        filter_doctor_id=template.filters.doctor_id,
+        filter_assignee=template.filters.assignee,
+        filter_patient_type=template.filters.patient_type,
+        filter_start_date=template.filters.start_date,
+        filter_end_date=template.filters.end_date,
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return _template_model_to_schema(t)
+
+
+@app.get("/export-templates/{template_id}", response_model=ExportTemplate, tags=["导出模板"])
+def get_export_template(template_id: int, db: Session = Depends(get_db)):
+    t = db.query(ExportTemplateModel).filter(ExportTemplateModel.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return _template_model_to_schema(t)
+
+
+@app.delete("/export-templates/{template_id}", tags=["导出模板"])
+def delete_export_template(template_id: int, db: Session = Depends(get_db)):
+    t = db.query(ExportTemplateModel).filter(ExportTemplateModel.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    db.delete(t)
+    db.commit()
+    return {"detail": "模板已删除"}
+
+
+@app.get("/export-templates/{template_id}/export", response_model=HighValueExportResponse, tags=["导出模板"])
+def export_by_template(template_id: int, db: Session = Depends(get_db)):
+    t = db.query(ExportTemplateModel).filter(ExportTemplateModel.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    stats = StatsService(db)
+    return stats.export_high_value_list(
+        clinic_id=t.filter_clinic_id,
+        alert_type=t.filter_alert_type,
+        status=t.filter_status,
+        doctor_id=t.filter_doctor_id,
+        assignee=t.filter_assignee,
+        patient_type=t.filter_patient_type,
+        start_date=t.filter_start_date,
+        end_date=t.filter_end_date,
+    )

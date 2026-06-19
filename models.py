@@ -168,3 +168,20 @@ class AlertAction(Base):
 
     alert = relationship("Alert", back_populates="actions")
     patient = relationship("Patient")
+
+
+class ExportTemplateModel(Base):
+    __tablename__ = "export_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(200))
+    filter_clinic_id = Column(Integer)
+    filter_alert_type = Column(String(30))
+    filter_status = Column(String(20))
+    filter_doctor_id = Column(Integer)
+    filter_assignee = Column(String(50))
+    filter_patient_type = Column(String(30))
+    filter_start_date = Column(Date)
+    filter_end_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.utcnow)

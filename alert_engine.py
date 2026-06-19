@@ -265,17 +265,24 @@ class AlertEngine:
         assignee: str,
         deadline: Optional[datetime] = None,
         assigned_by: Optional[str] = None
-    ) -> Tuple[int, int, List[int], List[int]]:
+    ) -> Tuple[int, int, List[int], List[int], Dict[int, str]]:
         success_count = 0
         failed_count = 0
         success_ids = []
         failed_ids = []
+        failed_details = {}
         now = datetime.utcnow()
         for alert_id in alert_ids:
             alert = self.db.query(Alert).filter(Alert.id == alert_id).first()
             if not alert:
                 failed_count += 1
                 failed_ids.append(alert_id)
+                failed_details[alert_id] = "预警记录不存在"
+                continue
+            if alert.status != "待处理":
+                failed_count += 1
+                failed_ids.append(alert_id)
+                failed_details[alert_id] = f"预警状态为'{alert.status}'，仅待处理预警可分派"
                 continue
             alert.assignee = assignee
             alert.assigned_at = now
@@ -293,7 +300,7 @@ class AlertEngine:
             success_count += 1
             success_ids.append(alert_id)
         self.db.commit()
-        return success_count, failed_count, success_ids, failed_ids
+        return success_count, failed_count, success_ids, failed_ids, failed_details
 
     def check_unfollowed(self) -> List[Alert]:
         new_alerts = []

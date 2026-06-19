@@ -441,8 +441,71 @@ class AlertBatchAssign(BaseModel):
 class AlertBatchAssignResult(BaseModel):
     success_count: int = 0
     failed_count: int = 0
-    failed_ids: List[int] = []
     success_ids: List[int] = []
+    failed_ids: List[int] = []
+    failed_details: Dict[int, str] = {}
+
+
+class ClinicAssigneeItem(BaseModel):
+    assignee: str
+    total_assigned: int = 0
+    resolved_count: int = 0
+    pending_count: int = 0
+    on_time_count: int = 0
+    overdue_count: int = 0
+    auto_resolved_count: int = 0
+    auto_resolve_rate: float = 0.0
+    on_time_rate: float = 0.0
+    avg_resolve_hours: float = 0.0
+
+
+class ClinicAssigneeView(BaseModel):
+    clinic_id: int
+    clinic_name: str
+    total_assigned: int = 0
+    total_resolved: int = 0
+    total_pending: int = 0
+    total_overdue: int = 0
+    overall_on_time_rate: float = 0.0
+    overall_auto_resolve_rate: float = 0.0
+    assignees: List[ClinicAssigneeItem] = []
+
+
+class ClinicAssigneeCrossViewResponse(BaseModel):
+    total_clinics: int = 0
+    total_assigned: int = 0
+    total_resolved: int = 0
+    total_pending: int = 0
+    total_overdue: int = 0
+    overall_on_time_rate: float = 0.0
+    overall_auto_resolve_rate: float = 0.0
+    overall_avg_resolve_hours: float = 0.0
+    clinics: List[ClinicAssigneeView] = []
+
+
+class ExportTemplateFilter(BaseModel):
+    clinic_id: Optional[int] = None
+    alert_type: Optional[str] = None
+    status: Optional[str] = None
+    doctor_id: Optional[int] = None
+    assignee: Optional[str] = None
+    patient_type: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+
+class ExportTemplateCreate(BaseModel):
+    name: str = Field(..., description="模板名称")
+    description: Optional[str] = Field(None, description="模板描述")
+    filters: ExportTemplateFilter = Field(default_factory=ExportTemplateFilter)
+
+
+class ExportTemplate(ExportTemplateCreate):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class AssigneePerformanceItem(BaseModel):
