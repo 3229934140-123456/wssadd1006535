@@ -17,6 +17,23 @@ class Clinic(Base):
     doctors = relationship("Doctor", back_populates="clinic")
     cleaning_records = relationship("CleaningRecord", back_populates="clinic")
     alerts = relationship("Alert", back_populates="clinic")
+    config = relationship("ClinicConfig", back_populates="clinic", uselist=False)
+
+
+class ClinicConfig(Base):
+    __tablename__ = "clinic_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    clinic_id = Column(Integer, ForeignKey("clinics.id"), nullable=False, unique=True)
+    followup_days_threshold = Column(Integer)
+    implant_interval_days = Column(Integer)
+    orthodontics_interval_days = Column(Integer)
+    periodontal_interval_days = Column(Integer)
+    regular_interval_days = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    clinic = relationship("Clinic", back_populates="config")
 
 
 class Doctor(Base):
@@ -118,6 +135,30 @@ class Alert(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     resolved_at = Column(DateTime)
     resolved_note = Column(Text)
+    resolved_by = Column(String(50))
+    auto_resolved = Column(Boolean, default=False)
+    auto_resolved_reason = Column(String(100))
 
     clinic = relationship("Clinic", back_populates="alerts")
     cleaning_record = relationship("CleaningRecord", back_populates="alerts")
+    actions = relationship("AlertAction", back_populates="alert", order_by="AlertAction.action_time.desc()")
+
+
+class AlertAction(Base):
+    __tablename__ = "alert_actions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(Integer, ForeignKey("alerts.id"), nullable=False, index=True)
+    clinic_id = Column(Integer, ForeignKey("clinics.id"), nullable=False)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    action_type = Column(String(30), nullable=False)
+    action_time = Column(DateTime, nullable=False, index=True)
+    operator = Column(String(50), nullable=False)
+    contact_method = Column(String(20))
+    content = Column(Text)
+    appointment_date = Column(Date)
+    close_reason = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    alert = relationship("Alert", back_populates="actions")
+    patient = relationship("Patient")

@@ -1,30 +1,34 @@
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
-from models import Clinic, Doctor, Patient, CleaningRecord, Followup, Appointment, Alert
+from models import Clinic, Doctor, Patient, CleaningRecord, Followup, Appointment, Alert, ClinicConfig, AlertAction
 from schemas import (
     ClinicCreate, Clinic as ClinicSchema,
+    ClinicConfigCreate, ClinicConfigUpdate, ClinicConfig as ClinicConfigSchema,
     DoctorCreate, Doctor as DoctorSchema,
     PatientCreate, Patient as PatientSchema,
     CleaningRecordCreate, CleaningRecord as CleaningRecordSchema,
     CleaningRecordBatchCreate, CleaningRecordBatchItem,
     FollowupCreate, Followup as FollowupSchema, FollowupSubmit,
     AppointmentCreate, Appointment as AppointmentSchema, AppointmentSubmit,
-    Alert as AlertSchema, AlertResolve, AlertDetail,
+    Alert as AlertSchema, AlertResolve, AlertDetail, AlertDetailWithTimeline,
+    AlertActionCreate, AlertAction as AlertActionSchema,
     ClinicStats, CleaningRecordDetail,
+    OverviewResponse, PatientAlertHistory, HighValueExportResponse,
 )
 from alert_engine import AlertEngine
 from stats_service import StatsService
+from config import ACTION_TYPES
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="洁治后流失预警后端服务",
     description="面向连锁口腔机构运营主管的洁治后服务闭环追踪系统",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 
@@ -32,8 +36,15 @@ app = FastAPI(
 def root():
     return {
         "service": "洁治后流失预警后端服务",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "docs": "/docs",
+        "features": [
+            "预警自动闭环（随访/预约补录自动关闭预警）",
+            "门店级独立阈值配置",
+            "总览统计（多维度筛选+分组排行）",
+            "处理记录时间线",
+            "重点名单导出"
+        ]
     }
 
 
@@ -49,6 +60,58 @@ def create_clinic(clinic: ClinicCreate, db: Session = Depends(get_db)):
 @app.get("/clinics/", response_model=List[ClinicSchema], tags=["基础数据"])
 def list_clinics(db: Session = Depends(get_db)):
     return db.query(Clinic).all()
+
+
+@app.post("/clinics/{clinic_id}/config", response_model=ClinicConfigSchema, tags=["门店配置"])
+def create_or_update_clinic_config(
+    clinic_id: int, config: ClinicConfigCreate, db: Session = Depends(get_db)
+):
+    clinic = db.query(Clinic).filter(Clinic.id == clinic_id).first()
+    if not clinic:
+        raise HTTPException(status_code=404, detail="门店不存在")
+    existing = db.query(ClinicConfig).filter(ClinicConfig.clinic_id == clinic_id).first()
+    if existing:
+        for key, value in config.model_dump(exclude_unset=True).items():
+            if key != "clinic_id" and value is not None:
+                setattr(existing, key, value)
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        return existing
+    db_config = ClinicConfig(**config.model_dump())
+    db.add(db_config)
+    db.commit()
+    db.refresh(db_config)
+    return db_config
+
+
+@app.patch("/clinics/{clinic_id}/config", response_model=ClinicConfigSchema, tags=["门店配置"])
+def update_clinic_config(
+    clinic_id: int, config: ClinicConfigUpdate, db: Session = Depends(get_db)
+):
+    db_config = db.query(ClinicConfig).filter(ClinicConfig.clinic_id == clinic_id).first()
+    if not db_config:
+        raise HTTPException(status_code=404, detail="门店配置不存在，请先创建")
+    for key, value in config.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(db_config, key, value)
+    db_config.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(db_config)
+    return db_config
+
+
+@app.get("/clinics/{clinic_id}/config", response_model=ClinicConfigSchema, tags=["门店配置"])
+def get_clinic_config(clinic_id: int, db: Session = Depends(get_db)):
+    config = db.query(ClinicConfig).filter(ClinicConfig.clinic_id == clinic_id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="门店配置不存在")
+    return config
+
+
+@app.get("/clinics/configs/", response_model=List[ClinicConfigSchema], tags=["门店配置"])
+def list_clinic_configs(db: Session = Depends(get_db)):
+    return db.query(ClinicConfig).all()
 
 
 @app.post("/doctors/", response_model=DoctorSchema, tags=["基础数据"])
@@ -99,6 +162,15 @@ def list_patients(
     if patient_type:
         query = query.filter(Patient.patient_type == patient_type)
     return query.all()
+
+
+@app.get("/patients/{patient_id}/alert-history", response_model=PatientAlertHistory, tags=["患者管理"])
+def get_patient_alert_history(patient_id: int, db: Session = Depends(get_db)):
+    stats = StatsService(db)
+    history = stats.get_patient_alert_history(patient_id)
+    if not history:
+        raise HTTPException(status_code=404, detail="患者不存在")
+    return history
 
 
 def _get_or_create_doctor(db: Session, clinic_id: int, doctor_name: str) -> Doctor:
@@ -235,7 +307,21 @@ def submit_followup(followup: FollowupSubmit, db: Session = Depends(get_db)):
     db.refresh(db_followup)
     engine = AlertEngine(db)
     engine.run_all_checks()
-    return {"followup_id": db_followup.id, "message": "随访记录已提交"}
+    pending_alerts = db.query(Alert).filter(
+        Alert.cleaning_record_id == record.id, Alert.status == "待处理"
+    ).count()
+    auto_resolved = db.query(Alert).filter(
+        Alert.cleaning_record_id == record.id,
+        Alert.status == "已处理",
+        Alert.auto_resolved == True
+    ).order_by(Alert.resolved_at.desc()).first()
+    return {
+        "followup_id": db_followup.id,
+        "message": "随访记录已提交",
+        "pending_alerts": pending_alerts,
+        "auto_resolved": auto_resolved is not None,
+        "auto_resolved_reason": auto_resolved.auto_resolved_reason if auto_resolved else None
+    }
 
 
 @app.get("/followups/", response_model=List[FollowupSchema], tags=["数据提交"])
@@ -271,7 +357,21 @@ def submit_appointment(appointment: AppointmentSubmit, db: Session = Depends(get
     db.refresh(db_appointment)
     engine = AlertEngine(db)
     engine.run_all_checks()
-    return {"appointment_id": db_appointment.id, "message": "预约记录已提交"}
+    pending_alerts = db.query(Alert).filter(
+        Alert.cleaning_record_id == record.id, Alert.status == "待处理"
+    ).count()
+    auto_resolved = db.query(Alert).filter(
+        Alert.cleaning_record_id == record.id,
+        Alert.status == "已处理",
+        Alert.auto_resolved == True
+    ).order_by(Alert.resolved_at.desc()).first()
+    return {
+        "appointment_id": db_appointment.id,
+        "message": "预约记录已提交",
+        "pending_alerts": pending_alerts,
+        "auto_resolved": auto_resolved is not None,
+        "auto_resolved_reason": auto_resolved.auto_resolved_reason if auto_resolved else None
+    }
 
 
 @app.get("/appointments/", response_model=List[AppointmentSchema], tags=["数据提交"])
@@ -295,8 +395,12 @@ def list_appointments(
 def run_alert_checks(db: Session = Depends(get_db)):
     engine = AlertEngine(db)
     new_alerts = engine.run_all_checks()
+    auto_resolved = db.query(Alert).filter(
+        Alert.status == "已处理", Alert.auto_resolved == True
+    ).count()
     return {
         "new_alerts_count": len(new_alerts),
+        "auto_resolved_count": auto_resolved,
         "alerts": [
             {"id": a.id, "type": a.alert_type, "title": a.title, "level": a.alert_level}
             for a in new_alerts
@@ -326,25 +430,104 @@ def list_alert_details(
     return stats.get_records_by_alert_type(clinic_id, alert_type, status)
 
 
+@app.get("/alerts/{alert_id}/timeline", response_model=AlertDetailWithTimeline, tags=["预警管理"])
+def get_alert_timeline(alert_id: int, db: Session = Depends(get_db)):
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="预警记录不存在")
+    record = db.query(CleaningRecord).filter(
+        CleaningRecord.id == alert.cleaning_record_id
+    ).first()
+    patient = db.query(Patient).filter(Patient.id == record.patient_id).first() if record else None
+    doctor = db.query(Doctor).filter(Doctor.id == record.doctor_id).first() if record else None
+    latest_followup = None
+    if record:
+        latest_followup = db.query(Followup).filter(
+            Followup.cleaning_record_id == record.id
+        ).order_by(Followup.followup_time.desc()).first()
+    alert_dict = {c.name: getattr(alert, c.name) for c in alert.__table__.columns}
+    alert_dict["patient_name"] = patient.name if patient else None
+    alert_dict["patient_phone"] = patient.phone if patient else None
+    alert_dict["doctor_name"] = doctor.name if doctor else None
+    alert_dict["cleaning_date"] = record.cleaning_date if record else None
+    alert_dict["last_followup_time"] = latest_followup.followup_time if latest_followup else None
+    alert_dict["last_followup_operator"] = latest_followup.operator if latest_followup else None
+    alert_dict["actions"] = alert.actions
+    return AlertDetailWithTimeline(**alert_dict)
+
+
+@app.post("/alerts/{alert_id}/actions", response_model=AlertActionSchema, tags=["预警管理"])
+def add_alert_action(
+    alert_id: int, action: AlertActionCreate, db: Session = Depends(get_db)
+):
+    if action.action_type not in ACTION_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的动作类型，必须是: {', '.join(ACTION_TYPES)}"
+        )
+    engine = AlertEngine(db)
+    result = engine.add_alert_action(
+        alert_id=alert_id,
+        action_type=action.action_type,
+        action_time=action.action_time,
+        operator=action.operator,
+        contact_method=action.contact_method,
+        content=action.content,
+        appointment_date=action.appointment_date,
+        close_reason=action.close_reason
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="预警记录不存在")
+    return result
+
+
+@app.get("/alerts/{alert_id}/actions", response_model=List[AlertActionSchema], tags=["预警管理"])
+def get_alert_actions(alert_id: int, db: Session = Depends(get_db)):
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="预警记录不存在")
+    return db.query(AlertAction).filter(
+        AlertAction.alert_id == alert_id
+    ).order_by(AlertAction.action_time.desc()).all()
+
+
 @app.post("/alerts/{alert_id}/resolve", response_model=AlertSchema, tags=["预警管理"])
 def resolve_alert(
-    alert_id: int, data: AlertResolve, db: Session = Depends(get_db)
+    alert_id: int, data: AlertResolve,
+    operator: Optional[str] = Query(None, description="处理人"),
+    db: Session = Depends(get_db)
 ):
     engine = AlertEngine(db)
-    alert = engine.resolve_alert(alert_id, data.resolved_note)
+    alert = engine.resolve_alert(alert_id, data.resolved_note, operator)
     if not alert:
         raise HTTPException(status_code=404, detail="预警记录不存在")
     return alert
+
+
+@app.get("/stats/overview", response_model=OverviewResponse, tags=["运营统计"])
+def get_overview_stats(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    clinic_id: Optional[int] = None,
+    doctor_id: Optional[int] = None,
+    patient_type: Optional[str] = Query(None, description="种植/正畸/牙周维护/常规洁治"),
+    db: Session = Depends(get_db)
+):
+    stats = StatsService(db)
+    return stats.get_overview(start_date, end_date, clinic_id, doctor_id, patient_type)
 
 
 @app.get("/stats/clinics/", response_model=List[ClinicStats], tags=["运营统计"])
 def get_clinics_stats(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    clinic_id: Optional[int] = None,
+    doctor_id: Optional[int] = None,
+    patient_type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     stats = StatsService(db)
-    return stats.get_all_clinics_stats(start_date, end_date)
+    return stats.get_all_clinics_stats(start_date, end_date, clinic_id, doctor_id, patient_type)
 
 
 @app.get("/stats/clinics/{clinic_id}", response_model=ClinicStats, tags=["运营统计"])
@@ -352,10 +535,12 @@ def get_clinic_stats(
     clinic_id: int,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    doctor_id: Optional[int] = None,
+    patient_type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     stats = StatsService(db)
-    return stats.get_clinic_stats(clinic_id, start_date, end_date)
+    return stats.get_clinic_stats(clinic_id, start_date, end_date, doctor_id, patient_type)
 
 
 @app.get("/stats/doctors/", tags=["运营统计"])
@@ -367,6 +552,15 @@ def get_doctors_stats(
 ):
     stats = StatsService(db)
     return stats.get_doctor_stats(clinic_id, start_date, end_date)
+
+
+@app.get("/stats/export/high-value", response_model=HighValueExportResponse, tags=["运营统计"])
+def export_high_value_list(
+    clinic_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    stats = StatsService(db)
+    return stats.export_high_value_list(clinic_id)
 
 
 @app.get(

@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -16,6 +16,36 @@ class ClinicCreate(ClinicBase):
 class Clinic(ClinicBase):
     id: int
     created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ClinicConfigBase(BaseModel):
+    clinic_id: int
+    followup_days_threshold: Optional[int] = None
+    implant_interval_days: Optional[int] = None
+    orthodontics_interval_days: Optional[int] = None
+    periodontal_interval_days: Optional[int] = None
+    regular_interval_days: Optional[int] = None
+
+
+class ClinicConfigCreate(ClinicConfigBase):
+    pass
+
+
+class ClinicConfigUpdate(BaseModel):
+    followup_days_threshold: Optional[int] = None
+    implant_interval_days: Optional[int] = None
+    orthodontics_interval_days: Optional[int] = None
+    periodontal_interval_days: Optional[int] = None
+    regular_interval_days: Optional[int] = None
+
+
+class ClinicConfig(ClinicConfigBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -161,6 +191,41 @@ class Alert(AlertBase):
     created_at: datetime
     resolved_at: Optional[datetime] = None
     resolved_note: Optional[str] = None
+    resolved_by: Optional[str] = None
+    auto_resolved: bool = False
+    auto_resolved_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AlertActionBase(BaseModel):
+    alert_id: int
+    action_type: str
+    action_time: datetime
+    operator: str
+    contact_method: Optional[str] = None
+    content: Optional[str] = None
+    appointment_date: Optional[date] = None
+    close_reason: Optional[str] = None
+
+
+class AlertActionCreate(BaseModel):
+    alert_id: int
+    action_type: str = Field(..., description="跟进类型: 电话/微信/短信/预约/关闭")
+    action_time: datetime
+    operator: str
+    contact_method: Optional[str] = None
+    content: Optional[str] = None
+    appointment_date: Optional[date] = None
+    close_reason: Optional[str] = None
+
+
+class AlertAction(AlertActionBase):
+    id: int
+    clinic_id: int
+    patient_id: int
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -173,6 +238,11 @@ class AlertDetail(Alert):
     cleaning_date: Optional[date] = None
     last_followup_time: Optional[datetime] = None
     last_followup_operator: Optional[str] = None
+    actions: List[AlertAction] = []
+
+
+class AlertDetailWithTimeline(AlertDetail):
+    actions: List[AlertAction] = []
 
 
 class Followup(FollowupBase):
@@ -232,3 +302,88 @@ class CleaningRecordDetail(BaseModel):
     alerts: List[Alert] = []
     responsible_person: Optional[str] = None
     last_process_time: Optional[datetime] = None
+
+
+class OverviewRankingItem(BaseModel):
+    id: int
+    name: str
+    total_cleanings: int = 0
+    followup_rate: float = 0.0
+    appointment_rate: float = 0.0
+    overdue_count: int = 0
+    alert_count: int = 0
+
+
+class OverviewSummary(BaseModel):
+    total_clinics: int = 0
+    total_doctors: int = 0
+    total_patients: int = 0
+    total_cleanings: int = 0
+    overall_followup_rate: float = 0.0
+    overall_appointment_rate: float = 0.0
+    total_overdue: int = 0
+    total_alerts_pending: int = 0
+    unfollowup_count: int = 0
+    unconverted_count: int = 0
+    high_value_overdue_count: int = 0
+
+
+class PatientActionHistory(BaseModel):
+    action_id: int
+    alert_id: int
+    alert_type: str
+    alert_title: str
+    action_type: str
+    action_time: datetime
+    operator: str
+    contact_method: Optional[str] = None
+    content: Optional[str] = None
+    close_reason: Optional[str] = None
+
+
+class PatientAlertHistory(BaseModel):
+    patient_id: int
+    patient_name: str
+    patient_phone: str
+    patient_type: str
+    total_alerts: int = 0
+    pending_alerts: int = 0
+    resolved_alerts: int = 0
+    actions: List[PatientActionHistory] = []
+
+
+class OverviewResponse(BaseModel):
+    summary: OverviewSummary
+    clinic_ranking: List[OverviewRankingItem] = []
+    doctor_ranking: List[OverviewRankingItem] = []
+    patient_type_breakdown: List[Dict[str, Any]] = []
+    date_range: Optional[Dict[str, Optional[date]]] = None
+
+
+class HighValueExportItem(BaseModel):
+    clinic_name: str
+    patient_name: str
+    patient_phone: str
+    patient_type: str
+    doctor_name: str
+    cleaning_date: date
+    overdue_days: int
+    alert_type: str
+    alert_title: str
+    responsible_person: Optional[str] = None
+    last_followup_time: Optional[datetime] = None
+    last_followup_content: Optional[str] = None
+
+
+class HighValueExportResponse(BaseModel):
+    clinic_id: Optional[int] = None
+    clinic_name: Optional[str] = None
+    export_time: datetime
+    total_count: int = 0
+    high_value_count: int = 0
+    unconverted_count: int = 0
+    items: List[HighValueExportItem] = []
+
+
+OverviewResponse.model_rebuild()
+PatientAlertHistory.model_rebuild()
