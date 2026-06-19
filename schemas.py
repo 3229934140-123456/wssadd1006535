@@ -431,6 +431,46 @@ class HighValueExportResponse(BaseModel):
     items: List[HighValueExportItem] = []
 
 
+class AlertBatchAssign(BaseModel):
+    alert_ids: List[int] = Field(..., description="预警ID列表")
+    assignee: str = Field(..., description="负责人姓名")
+    deadline: Optional[datetime] = Field(None, description="跟进截止时间")
+    assigned_by: Optional[str] = Field(None, description="分派人")
+
+
+class AlertBatchAssignResult(BaseModel):
+    success_count: int = 0
+    failed_count: int = 0
+    failed_ids: List[int] = []
+    success_ids: List[int] = []
+
+
+class AssigneePerformanceItem(BaseModel):
+    assignee: str
+    clinic_id: Optional[int] = None
+    clinic_name: Optional[str] = None
+    total_assigned: int = 0
+    resolved_count: int = 0
+    pending_count: int = 0
+    on_time_count: int = 0
+    overdue_count: int = 0
+    auto_resolved_count: int = 0
+    auto_resolve_rate: float = 0.0
+    on_time_rate: float = 0.0
+    avg_resolve_hours: float = 0.0
+
+
+class AssigneePerformanceResponse(BaseModel):
+    total_assignees: int = 0
+    total_assigned: int = 0
+    total_resolved: int = 0
+    total_pending: int = 0
+    overall_on_time_rate: float = 0.0
+    overall_auto_resolve_rate: float = 0.0
+    overall_avg_resolve_hours: float = 0.0
+    items: List[AssigneePerformanceItem] = []
+
+
 OverviewResponse.model_rebuild()
 PatientAlertHistory.model_rebuild()
 TrendResponse.model_rebuild()

@@ -14,11 +14,11 @@ from schemas import (
     CleaningRecordBatchCreate, CleaningRecordBatchItem,
     FollowupCreate, Followup as FollowupSchema, FollowupSubmit,
     AppointmentCreate, Appointment as AppointmentSchema, AppointmentSubmit,
-    Alert as AlertSchema, AlertResolve, AlertAssign, AlertDetail, AlertDetailWithTimeline,
+    Alert as AlertSchema, AlertResolve, AlertAssign, AlertBatchAssign, AlertBatchAssignResult, AlertDetail, AlertDetailWithTimeline,
     AlertActionCreate, AlertAction as AlertActionSchema,
     ClinicStats, CleaningRecordDetail,
     OverviewResponse, PatientAlertHistory, HighValueExportResponse,
-    TrendResponse,
+    TrendResponse, AssigneePerformanceResponse,
 )
 from alert_engine import AlertEngine
 from stats_service import StatsService
@@ -29,7 +29,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="洁治后流失预警后端服务",
     description="面向连锁口腔机构运营主管的洁治后服务闭环追踪系统",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 
@@ -37,7 +37,7 @@ app = FastAPI(
 def root():
     return {
         "service": "洁治后流失预警后端服务",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "docs": "/docs",
         "features": [
             "预警自动闭环（随访/预约补录自动关闭预警）",
@@ -47,7 +47,10 @@ def root():
             "重点名单导出",
             "预警任务分派（分派给客服/医生，设置截止时间）",
             "趋势分析（按天/周统计新增、处理、自动闭环比例，支持门店对比）",
-            "处理人/时间明确显示（列表/详情/导出信息统一）"
+            "处理人/时间明确显示（列表/详情/导出信息统一）",
+            "批量分派（多选预警一次性分给同一负责人）",
+            "负责人绩效统计（分派数、按时完成率、平均处理时长）",
+            "多维度导出（按类型/状态/门店/医生/负责人/时间范围筛选）",
         ]
     }
 
@@ -540,6 +543,23 @@ def assign_alert(alert_id: int, assign: AlertAssign, db: Session = Depends(get_d
     return alert
 
 
+@app.post("/alerts/batch-assign", response_model=AlertBatchAssignResult, tags=["预警管理"])
+def batch_assign_alerts(assign: AlertBatchAssign, db: Session = Depends(get_db)):
+    engine = AlertEngine(db)
+    success_count, failed_count, success_ids, failed_ids = engine.batch_assign_alerts(
+        alert_ids=assign.alert_ids,
+        assignee=assign.assignee,
+        deadline=assign.deadline,
+        assigned_by=assign.assigned_by
+    )
+    return AlertBatchAssignResult(
+        success_count=success_count,
+        failed_count=failed_count,
+        success_ids=success_ids,
+        failed_ids=failed_ids
+    )
+
+
 @app.get("/stats/trend", response_model=TrendResponse, tags=["运营统计"])
 def get_trend_stats(
     period_type: str = Query("day", description="统计周期: day/week"),
@@ -553,6 +573,21 @@ def get_trend_stats(
         raise HTTPException(status_code=400, detail="统计周期必须是 day 或 week")
     stats = StatsService(db)
     return stats.get_trend(period_type, start_date, end_date, clinic_id, compare_clinic)
+
+
+@app.get("/stats/assignee-performance", response_model=AssigneePerformanceResponse, tags=["运营统计"])
+def get_assignee_performance(
+    clinic_id: Optional[int] = Query(None, description="门店ID"),
+    start_date: Optional[date] = Query(None, description="开始日期"),
+    end_date: Optional[date] = Query(None, description="结束日期"),
+    db: Session = Depends(get_db)
+):
+    stats = StatsService(db)
+    return stats.get_assignee_performance(
+        clinic_id=clinic_id,
+        start_date=start_date,
+        end_date=end_date
+    )
 
 
 @app.get("/stats/overview", response_model=OverviewResponse, tags=["运营统计"])
@@ -609,11 +644,27 @@ def get_doctors_stats(
 
 @app.get("/stats/export/high-value", response_model=HighValueExportResponse, tags=["运营统计"])
 def export_high_value_list(
-    clinic_id: Optional[int] = None,
+    clinic_id: Optional[int] = Query(None, description="门店ID"),
+    alert_type: Optional[str] = Query(None, description="预警类型：未随访/未转化/高价值维护"),
+    status: Optional[str] = Query(None, description="预警状态：待处理/已处理"),
+    doctor_id: Optional[int] = Query(None, description="医生ID"),
+    assignee: Optional[str] = Query(None, description="负责人姓名"),
+    patient_type: Optional[str] = Query(None, description="患者类型：种植/正畸/牙周维护/常规洁治"),
+    start_date: Optional[date] = Query(None, description="预警创建开始日期"),
+    end_date: Optional[date] = Query(None, description="预警创建结束日期"),
     db: Session = Depends(get_db)
 ):
     stats = StatsService(db)
-    return stats.export_high_value_list(clinic_id)
+    return stats.export_high_value_list(
+        clinic_id=clinic_id,
+        alert_type=alert_type,
+        status=status,
+        doctor_id=doctor_id,
+        assignee=assignee,
+        patient_type=patient_type,
+        start_date=start_date,
+        end_date=end_date
+    )
 
 
 @app.get(

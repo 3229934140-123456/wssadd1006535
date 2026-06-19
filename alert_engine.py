@@ -259,6 +259,42 @@ class AlertEngine:
         self.db.refresh(alert)
         return alert
 
+    def batch_assign_alerts(
+        self,
+        alert_ids: List[int],
+        assignee: str,
+        deadline: Optional[datetime] = None,
+        assigned_by: Optional[str] = None
+    ) -> Tuple[int, int, List[int], List[int]]:
+        success_count = 0
+        failed_count = 0
+        success_ids = []
+        failed_ids = []
+        now = datetime.utcnow()
+        for alert_id in alert_ids:
+            alert = self.db.query(Alert).filter(Alert.id == alert_id).first()
+            if not alert:
+                failed_count += 1
+                failed_ids.append(alert_id)
+                continue
+            alert.assignee = assignee
+            alert.assigned_at = now
+            alert.assigned_by = assigned_by
+            alert.deadline = deadline
+            self._add_action(
+                alert_id=alert.id,
+                clinic_id=alert.clinic_id,
+                patient_id=alert.cleaning_record.patient_id,
+                action_type="分派",
+                action_time=now,
+                operator=assigned_by or "系统",
+                content=f"批量分派给 {assignee}" + (f"，截止时间：{deadline.strftime('%Y-%m-%d %H:%M')}" if deadline else "")
+            )
+            success_count += 1
+            success_ids.append(alert_id)
+        self.db.commit()
+        return success_count, failed_count, success_ids, failed_ids
+
     def check_unfollowed(self) -> List[Alert]:
         new_alerts = []
         records = self.db.query(CleaningRecord).all()

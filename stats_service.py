@@ -11,7 +11,8 @@ from schemas import (
     ClinicStats, CleaningRecordDetail, OverviewResponse, OverviewSummary,
     OverviewRankingItem, PatientAlertHistory, PatientActionHistory,
     HighValueExportResponse, HighValueExportItem,
-    TrendResponse, TrendDataPoint
+    TrendResponse, TrendDataPoint,
+    AssigneePerformanceResponse, AssigneePerformanceItem
 )
 from config import (
     HIGH_VALUE_PATIENT_TYPES,
@@ -643,7 +644,15 @@ class StatsService:
         )
 
     def export_high_value_list(
-        self, clinic_id: Optional[int] = None
+        self,
+        clinic_id: Optional[int] = None,
+        alert_type: Optional[str] = None,
+        status: Optional[str] = None,
+        doctor_id: Optional[int] = None,
+        assignee: Optional[str] = None,
+        patient_type: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
     ) -> HighValueExportResponse:
         clinic_name = None
         if clinic_id:
@@ -651,14 +660,33 @@ class StatsService:
             if clinic:
                 clinic_name = clinic.name
 
-        alerts_query = self.db.query(Alert).filter(
-            and_(
-                Alert.status == "待处理",
+        alerts_query = self.db.query(Alert).join(
+            CleaningRecord, Alert.cleaning_record_id == CleaningRecord.id
+        )
+        if alert_type:
+            alerts_query = alerts_query.filter(Alert.alert_type == alert_type)
+        elif status is None:
+            alerts_query = alerts_query.filter(
                 Alert.alert_type.in_(["高价值维护", "未转化"])
             )
-        )
+        if status:
+            alerts_query = alerts_query.filter(Alert.status == status)
+        elif alert_type is None:
+            alerts_query = alerts_query.filter(Alert.status == "待处理")
         if clinic_id:
             alerts_query = alerts_query.filter(Alert.clinic_id == clinic_id)
+        if doctor_id:
+            alerts_query = alerts_query.filter(CleaningRecord.doctor_id == doctor_id)
+        if assignee:
+            alerts_query = alerts_query.filter(Alert.assignee == assignee)
+        if patient_type:
+            alerts_query = alerts_query.join(Patient).filter(
+                Patient.patient_type == patient_type
+            )
+        if start_date:
+            alerts_query = alerts_query.filter(Alert.created_at >= datetime.combine(start_date, datetime.min.time()))
+        if end_date:
+            alerts_query = alerts_query.filter(Alert.created_at <= datetime.combine(end_date, datetime.max.time()))
 
         alerts = alerts_query.order_by(Alert.alert_type, Alert.created_at.desc()).all()
 
@@ -684,7 +712,7 @@ class StatsService:
 
             if alert.alert_type == "高价值维护":
                 high_value_count += 1
-            else:
+            elif alert.alert_type == "未转化":
                 unconverted_count += 1
 
             items.append(HighValueExportItem(
@@ -881,4 +909,113 @@ class StatsService:
             clinic_id=clinic_id,
             data_points=data_points,
             by_clinic=by_clinic_data if compare_clinic else None
+        )
+
+    def get_assignee_performance(
+        self,
+        clinic_id: Optional[int] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> AssigneePerformanceResponse:
+        now = datetime.utcnow()
+        alerts_query = self.db.query(Alert).filter(Alert.assignee.isnot(None))
+        if clinic_id:
+            alerts_query = alerts_query.filter(Alert.clinic_id == clinic_id)
+        if start_date:
+            alerts_query = alerts_query.filter(Alert.created_at >= datetime.combine(start_date, datetime.min.time()))
+        if end_date:
+            alerts_query = alerts_query.filter(Alert.created_at <= datetime.combine(end_date, datetime.max.time()))
+
+        alerts = alerts_query.all()
+
+        assignee_data = {}
+        total_assigned = 0
+        total_resolved = 0
+        total_pending = 0
+        total_resolve_hours = 0.0
+        total_auto_resolved = 0
+
+        for alert in alerts:
+            assignee = alert.assignee
+            if assignee not in assignee_data:
+                assignee_data[assignee] = {
+                    "assignee": assignee,
+                    "clinic_id": alert.clinic_id,
+                    "total_assigned": 0,
+                    "resolved_count": 0,
+                    "pending_count": 0,
+                    "on_time_count": 0,
+                    "overdue_count": 0,
+                    "auto_resolved_count": 0,
+                    "total_resolve_hours": 0.0,
+                }
+
+            data = assignee_data[assignee]
+            data["total_assigned"] += 1
+            total_assigned += 1
+
+            if alert.status == "已处理":
+                data["resolved_count"] += 1
+                total_resolved += 1
+                if alert.auto_resolved:
+                    data["auto_resolved_count"] += 1
+                    total_auto_resolved += 1
+                if alert.resolved_at and alert.created_at:
+                    delta = alert.resolved_at - alert.created_at
+                    hours = delta.total_seconds() / 3600
+                    data["total_resolve_hours"] += hours
+                    total_resolve_hours += hours
+                if alert.deadline and alert.resolved_at:
+                    if alert.resolved_at <= alert.deadline:
+                        data["on_time_count"] += 1
+                    else:
+                        data["overdue_count"] += 1
+            else:
+                data["pending_count"] += 1
+                total_pending += 1
+                if alert.deadline and now > alert.deadline:
+                    data["overdue_count"] += 1
+
+        items = []
+        for assignee, data in assignee_data.items():
+            clinic = self.db.query(Clinic).filter(Clinic.id == data["clinic_id"]).first()
+            resolved = data["resolved_count"]
+            avg_hours = round(data["total_resolve_hours"] / resolved, 1) if resolved > 0 else 0.0
+            auto_rate = round(data["auto_resolved_count"] / resolved * 100, 1) if resolved > 0 else 0.0
+            with_deadline = data["on_time_count"] + (data["overdue_count"] if data["pending_count"] == 0 else max(0, data["overdue_count"] - data["pending_count"]))
+            total_with_deadline = data["on_time_count"] + data["overdue_count"]
+            on_time_rate = round(data["on_time_count"] / total_with_deadline * 100, 1) if total_with_deadline > 0 else 0.0
+            items.append(AssigneePerformanceItem(
+                assignee=assignee,
+                clinic_id=data["clinic_id"],
+                clinic_name=clinic.name if clinic else None,
+                total_assigned=data["total_assigned"],
+                resolved_count=resolved,
+                pending_count=data["pending_count"],
+                on_time_count=data["on_time_count"],
+                overdue_count=data["overdue_count"],
+                auto_resolved_count=data["auto_resolved_count"],
+                auto_resolve_rate=auto_rate,
+                on_time_rate=on_time_rate,
+                avg_resolve_hours=avg_hours,
+            ))
+
+        items.sort(key=lambda x: x.total_assigned, reverse=True)
+
+        overall_avg = round(total_resolve_hours / total_resolved, 1) if total_resolved > 0 else 0.0
+        overall_auto_rate = round(total_auto_resolved / total_resolved * 100, 1) if total_resolved > 0 else 0.0
+
+        total_with_deadline_all = sum(i.on_time_count + i.overdue_count for i in items)
+        total_on_time_all = sum(i.on_time_count for i in items)
+        overall_on_time_rate = round(total_on_time_all / total_with_deadline_all * 100, 1) if total_with_deadline_all > 0 else 0.0
+
+        return AssigneePerformanceResponse(
+            total_assignees=len(items),
+            total_assigned=total_assigned,
+            total_resolved=total_resolved,
+            total_pending=total_pending,
+            overall_on_time_rate=overall_on_time_rate,
+            overall_auto_resolve_rate=overall_auto_rate,
+            overall_avg_resolve_hours=overall_avg,
+            items=items
         )
