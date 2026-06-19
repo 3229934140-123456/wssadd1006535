@@ -39,6 +39,8 @@ class AlertEngine:
                 continue
             should_resolve = False
             resolve_reason = ""
+            resolve_operator = "系统自动"
+            resolve_detail = ""
             if alert.alert_type == "未随访":
                 has_followup = self.db.query(Followup).filter(
                     Followup.cleaning_record_id == record.id
@@ -50,6 +52,8 @@ class AlertEngine:
                         Followup.cleaning_record_id == record.id
                     ).order_by(Followup.followup_time.desc()).first()
                     if latest_followup:
+                        resolve_operator = latest_followup.operator
+                        resolve_detail = f"随访补录-{latest_followup.operator}（{latest_followup.followup_time.strftime('%Y-%m-%d %H:%M')}）"
                         self._add_action(
                             alert_id=alert.id,
                             clinic_id=alert.clinic_id,
@@ -75,13 +79,15 @@ class AlertEngine:
                         Appointment.cleaning_record_id == record.id
                     ).order_by(Appointment.created_at.desc()).first()
                     if latest_appointment:
+                        resolve_operator = latest_appointment.operator or "系统自动"
+                        resolve_detail = f"预约补录-{latest_appointment.operator or '系统自动'}（{latest_appointment.created_at.strftime('%Y-%m-%d %H:%M')}）"
                         self._add_action(
                             alert_id=alert.id,
                             clinic_id=alert.clinic_id,
                             patient_id=record.patient_id,
                             action_type="预约",
                             action_time=latest_appointment.created_at,
-                            operator="系统自动",
+                            operator=latest_appointment.operator or "系统自动",
                             appointment_date=latest_appointment.appointment_date,
                             content=f"已预约{latest_appointment.appointment_type}，日期：{latest_appointment.appointment_date}",
                             auto_action=True
@@ -99,6 +105,8 @@ class AlertEngine:
                         if not has_symptom:
                             should_resolve = True
                             resolve_reason = "最新随访显示症状已消除"
+                            resolve_operator = latest_followup.operator
+                            resolve_detail = f"随访症状消除-{latest_followup.operator}（{latest_followup.followup_time.strftime('%Y-%m-%d %H:%M')}）"
                             self._add_action(
                                 alert_id=alert.id,
                                 clinic_id=alert.clinic_id,
@@ -124,13 +132,15 @@ class AlertEngine:
                         Appointment.cleaning_record_id == record.id
                     ).order_by(Appointment.created_at.desc()).first()
                     if latest_appointment:
+                        resolve_operator = latest_appointment.operator or "系统自动"
+                        resolve_detail = f"复诊预约-{latest_appointment.operator or '系统自动'}（{latest_appointment.created_at.strftime('%Y-%m-%d %H:%M')}）"
                         self._add_action(
                             alert_id=alert.id,
                             clinic_id=alert.clinic_id,
                             patient_id=record.patient_id,
                             action_type="预约",
                             action_time=latest_appointment.created_at,
-                            operator="系统自动",
+                            operator=latest_appointment.operator or "系统自动",
                             appointment_date=latest_appointment.appointment_date,
                             content=f"已预约{latest_appointment.appointment_type}，日期：{latest_appointment.appointment_date}",
                             auto_action=True
@@ -139,6 +149,8 @@ class AlertEngine:
                 alert.status = "已处理"
                 alert.resolved_at = datetime.utcnow()
                 alert.resolved_note = resolve_reason
+                alert.resolved_by = resolve_operator
+                alert.resolved_detail = resolve_detail
                 alert.auto_resolved = True
                 alert.auto_resolved_reason = resolve_reason
                 self._add_action(
@@ -147,9 +159,9 @@ class AlertEngine:
                     patient_id=record.patient_id,
                     action_type="关闭",
                     action_time=datetime.utcnow(),
-                    operator="系统自动",
+                    operator=resolve_operator,
                     close_reason=resolve_reason,
-                    content=resolve_reason,
+                    content=resolve_detail,
                     auto_action=True
                 )
 
@@ -214,10 +226,38 @@ class AlertEngine:
             alert.resolved_at = datetime.utcnow()
             alert.resolved_note = close_reason or "手动关闭"
             alert.resolved_by = operator
+            alert.resolved_detail = f"手动关闭-{operator}（{datetime.utcnow().strftime('%Y-%m-%d %H:%M')}）"
             alert.auto_resolved = False
         self.db.commit()
         self.db.refresh(action)
         return action
+
+    def assign_alert(
+        self,
+        alert_id: int,
+        assignee: str,
+        deadline: Optional[datetime] = None,
+        assigned_by: Optional[str] = None
+    ) -> Optional[Alert]:
+        alert = self.db.query(Alert).filter(Alert.id == alert_id).first()
+        if not alert:
+            return None
+        alert.assignee = assignee
+        alert.assigned_at = datetime.utcnow()
+        alert.assigned_by = assigned_by
+        alert.deadline = deadline
+        self._add_action(
+            alert_id=alert.id,
+            clinic_id=alert.clinic_id,
+            patient_id=alert.cleaning_record.patient_id,
+            action_type="分派",
+            action_time=datetime.utcnow(),
+            operator=assigned_by or "系统",
+            content=f"分派给 {assignee}" + (f"，截止时间：{deadline.strftime('%Y-%m-%d %H:%M')}" if deadline else "")
+        )
+        self.db.commit()
+        self.db.refresh(alert)
+        return alert
 
     def check_unfollowed(self) -> List[Alert]:
         new_alerts = []
@@ -406,6 +446,7 @@ class AlertEngine:
         alert.resolved_at = datetime.utcnow()
         alert.resolved_note = resolved_note
         alert.resolved_by = operator
+        alert.resolved_detail = f"手动关闭-{operator or '手动处理'}（{datetime.utcnow().strftime('%Y-%m-%d %H:%M')}）"
         alert.auto_resolved = False
         self._add_action(
             alert_id=alert.id,
@@ -424,15 +465,33 @@ class AlertEngine:
     def get_alerts_by_clinic(
         self, clinic_id: Optional[int] = None,
         status: Optional[str] = None,
-        alert_type: Optional[str] = None
+        alert_type: Optional[str] = None,
+        assignee: Optional[str] = None,
+        is_overdue_deadline: Optional[bool] = None,
+        doctor_id: Optional[int] = None,
+        patient_type: Optional[str] = None
     ) -> List[Alert]:
-        query = self.db.query(Alert)
+        query = self.db.query(Alert).join(CleaningRecord, Alert.cleaning_record_id == CleaningRecord.id)
         if clinic_id:
             query = query.filter(Alert.clinic_id == clinic_id)
         if status:
             query = query.filter(Alert.status == status)
         if alert_type:
             query = query.filter(Alert.alert_type == alert_type)
+        if assignee:
+            query = query.filter(Alert.assignee == assignee)
+        if is_overdue_deadline is not None:
+            now = datetime.utcnow()
+            if is_overdue_deadline:
+                query = query.filter(Alert.deadline.isnot(None), Alert.deadline < now)
+            else:
+                query = query.filter(or_(Alert.deadline.is_(None), Alert.deadline >= now))
+        if doctor_id:
+            query = query.filter(CleaningRecord.doctor_id == doctor_id)
+        if patient_type:
+            query = query.join(Patient, CleaningRecord.patient_id == Patient.id).filter(
+                Patient.patient_type == patient_type
+            )
         return query.order_by(Alert.created_at.desc()).all()
 
     def get_alert_detail(self, alert_id: int) -> Optional[Alert]:

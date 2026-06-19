@@ -114,6 +114,7 @@ class Appointment(Base):
     appointment_type = Column(String(50))
     status = Column(String(20), default="待就诊")
     notes = Column(Text)
+    operator = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     cleaning_record = relationship("CleaningRecord", back_populates="appointments")
@@ -138,6 +139,11 @@ class Alert(Base):
     resolved_by = Column(String(50))
     auto_resolved = Column(Boolean, default=False)
     auto_resolved_reason = Column(String(100))
+    resolved_detail = Column(String(200))
+    assignee = Column(String(50))
+    assigned_at = Column(DateTime)
+    assigned_by = Column(String(50))
+    deadline = Column(DateTime)
 
     clinic = relationship("Clinic", back_populates="alerts")
     cleaning_record = relationship("CleaningRecord", back_populates="alerts")

@@ -154,6 +154,7 @@ class AppointmentBase(BaseModel):
     appointment_type: Optional[str] = None
     status: str = "待就诊"
     notes: Optional[str] = None
+    operator: Optional[str] = None
 
 
 class AppointmentCreate(AppointmentBase):
@@ -165,6 +166,7 @@ class AppointmentSubmit(BaseModel):
     appointment_date: date
     appointment_type: Optional[str] = None
     notes: Optional[str] = None
+    operator: Optional[str] = None
 
 
 class AlertBase(BaseModel):
@@ -186,6 +188,12 @@ class AlertResolve(BaseModel):
     resolved_note: Optional[str] = None
 
 
+class AlertAssign(BaseModel):
+    assignee: str = Field(..., description="负责人姓名")
+    deadline: Optional[datetime] = Field(None, description="跟进截止时间")
+    assigned_by: Optional[str] = Field(None, description="分派人")
+
+
 class Alert(AlertBase):
     id: int
     created_at: datetime
@@ -194,6 +202,11 @@ class Alert(AlertBase):
     resolved_by: Optional[str] = None
     auto_resolved: bool = False
     auto_resolved_reason: Optional[str] = None
+    resolved_detail: Optional[str] = None
+    assignee: Optional[str] = None
+    assigned_at: Optional[datetime] = None
+    assigned_by: Optional[str] = None
+    deadline: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -239,10 +252,30 @@ class AlertDetail(Alert):
     last_followup_time: Optional[datetime] = None
     last_followup_operator: Optional[str] = None
     actions: List[AlertAction] = []
+    is_overdue_deadline: Optional[bool] = None
 
 
 class AlertDetailWithTimeline(AlertDetail):
     actions: List[AlertAction] = []
+
+
+class TrendDataPoint(BaseModel):
+    period: str
+    start_date: date
+    end_date: date
+    new_alerts: int = 0
+    resolved_alerts: int = 0
+    auto_resolved_count: int = 0
+    auto_resolve_rate: float = 0.0
+    avg_resolve_hours: float = 0.0
+    pending_alerts: int = 0
+
+
+class TrendResponse(BaseModel):
+    period_type: str
+    clinic_id: Optional[int] = None
+    data_points: List[TrendDataPoint] = []
+    by_clinic: Optional[Dict[int, List[TrendDataPoint]]] = None
 
 
 class Followup(FollowupBase):
@@ -308,9 +341,15 @@ class OverviewRankingItem(BaseModel):
     id: int
     name: str
     total_cleanings: int = 0
+    followed_up_count: int = 0
+    appointed_count: int = 0
     followup_rate: float = 0.0
     appointment_rate: float = 0.0
     overdue_count: int = 0
+    unfollowup_count: int = 0
+    unconverted_count: int = 0
+    high_value_overdue_count: int = 0
+    alert_pending_count: int = 0
     alert_count: int = 0
 
 
@@ -370,7 +409,14 @@ class HighValueExportItem(BaseModel):
     overdue_days: int
     alert_type: str
     alert_title: str
+    status: str
     responsible_person: Optional[str] = None
+    assignee: Optional[str] = None
+    deadline: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolved_detail: Optional[str] = None
+    auto_resolved: Optional[bool] = None
     last_followup_time: Optional[datetime] = None
     last_followup_content: Optional[str] = None
 
@@ -387,3 +433,4 @@ class HighValueExportResponse(BaseModel):
 
 OverviewResponse.model_rebuild()
 PatientAlertHistory.model_rebuild()
+TrendResponse.model_rebuild()

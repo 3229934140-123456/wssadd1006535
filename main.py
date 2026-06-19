@@ -14,10 +14,11 @@ from schemas import (
     CleaningRecordBatchCreate, CleaningRecordBatchItem,
     FollowupCreate, Followup as FollowupSchema, FollowupSubmit,
     AppointmentCreate, Appointment as AppointmentSchema, AppointmentSubmit,
-    Alert as AlertSchema, AlertResolve, AlertDetail, AlertDetailWithTimeline,
+    Alert as AlertSchema, AlertResolve, AlertAssign, AlertDetail, AlertDetailWithTimeline,
     AlertActionCreate, AlertAction as AlertActionSchema,
     ClinicStats, CleaningRecordDetail,
     OverviewResponse, PatientAlertHistory, HighValueExportResponse,
+    TrendResponse,
 )
 from alert_engine import AlertEngine
 from stats_service import StatsService
@@ -28,7 +29,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="洁治后流失预警后端服务",
     description="面向连锁口腔机构运营主管的洁治后服务闭环追踪系统",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 
@@ -36,14 +37,17 @@ app = FastAPI(
 def root():
     return {
         "service": "洁治后流失预警后端服务",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "docs": "/docs",
         "features": [
             "预警自动闭环（随访/预约补录自动关闭预警）",
             "门店级独立阈值配置",
-            "总览统计（多维度筛选+分组排行）",
+            "总览统计（多维度筛选+分组排行，排行带逾期/待处理数）",
             "处理记录时间线",
-            "重点名单导出"
+            "重点名单导出",
+            "预警任务分派（分派给客服/医生，设置截止时间）",
+            "趋势分析（按天/周统计新增、处理、自动闭环比例，支持门店对比）",
+            "处理人/时间明确显示（列表/详情/导出信息统一）"
         ]
     }
 
@@ -301,6 +305,7 @@ def submit_followup(followup: FollowupSubmit, db: Session = Depends(get_db)):
             patient_id=record.patient_id,
             appointment_date=followup.appointment_date,
             appointment_type=followup.appointment_type or "复查",
+            operator=followup.operator,
         )
         db.add(appointment)
     db.commit()
@@ -351,6 +356,7 @@ def submit_appointment(appointment: AppointmentSubmit, db: Session = Depends(get
         appointment_date=appointment.appointment_date,
         appointment_type=appointment.appointment_type,
         notes=appointment.notes,
+        operator=appointment.operator,
     )
     db.add(db_appointment)
     db.commit()
@@ -413,10 +419,22 @@ def list_alerts(
     clinic_id: Optional[int] = None,
     alert_type: Optional[str] = Query(None, description="未随访/未转化/高价值维护"),
     status: Optional[str] = Query(None, description="待处理/已处理"),
+    assignee: Optional[str] = Query(None, description="负责人姓名"),
+    is_overdue_deadline: Optional[bool] = Query(None, description="是否超跟进截止时间"),
+    doctor_id: Optional[int] = None,
+    patient_type: Optional[str] = Query(None, description="种植/正畸/牙周维护/常规洁治"),
     db: Session = Depends(get_db)
 ):
     engine = AlertEngine(db)
-    return engine.get_alerts_by_clinic(clinic_id, status, alert_type)
+    return engine.get_alerts_by_clinic(
+        clinic_id=clinic_id,
+        status=status,
+        alert_type=alert_type,
+        assignee=assignee,
+        is_overdue_deadline=is_overdue_deadline,
+        doctor_id=doctor_id,
+        patient_type=patient_type
+    )
 
 
 @app.get("/alerts/details/", tags=["预警管理"])
@@ -453,6 +471,10 @@ def get_alert_timeline(alert_id: int, db: Session = Depends(get_db)):
     alert_dict["last_followup_time"] = latest_followup.followup_time if latest_followup else None
     alert_dict["last_followup_operator"] = latest_followup.operator if latest_followup else None
     alert_dict["actions"] = alert.actions
+    is_overdue = None
+    if alert.deadline and alert.status == "待处理":
+        is_overdue = alert.deadline < datetime.utcnow()
+    alert_dict["is_overdue_deadline"] = is_overdue
     return AlertDetailWithTimeline(**alert_dict)
 
 
@@ -504,6 +526,35 @@ def resolve_alert(
     return alert
 
 
+@app.post("/alerts/{alert_id}/assign", response_model=AlertSchema, tags=["预警管理"])
+def assign_alert(alert_id: int, assign: AlertAssign, db: Session = Depends(get_db)):
+    engine = AlertEngine(db)
+    alert = engine.assign_alert(
+        alert_id=alert_id,
+        assignee=assign.assignee,
+        deadline=assign.deadline,
+        assigned_by=assign.assigned_by
+    )
+    if not alert:
+        raise HTTPException(status_code=404, detail="预警记录不存在")
+    return alert
+
+
+@app.get("/stats/trend", response_model=TrendResponse, tags=["运营统计"])
+def get_trend_stats(
+    period_type: str = Query("day", description="统计周期: day/week"),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    clinic_id: Optional[int] = None,
+    compare_clinic: bool = Query(False, description="是否按门店对比"),
+    db: Session = Depends(get_db)
+):
+    if period_type not in ["day", "week"]:
+        raise HTTPException(status_code=400, detail="统计周期必须是 day 或 week")
+    stats = StatsService(db)
+    return stats.get_trend(period_type, start_date, end_date, clinic_id, compare_clinic)
+
+
 @app.get("/stats/overview", response_model=OverviewResponse, tags=["运营统计"])
 def get_overview_stats(
     start_date: Optional[date] = None,
@@ -548,10 +599,12 @@ def get_doctors_stats(
     clinic_id: Optional[int] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    doctor_id: Optional[int] = None,
+    patient_type: Optional[str] = Query(None, description="种植/正畸/牙周维护/常规洁治"),
     db: Session = Depends(get_db)
 ):
     stats = StatsService(db)
-    return stats.get_doctor_stats(clinic_id, start_date, end_date)
+    return stats.get_doctor_stats(clinic_id, start_date, end_date, doctor_id, patient_type)
 
 
 @app.get("/stats/export/high-value", response_model=HighValueExportResponse, tags=["运营统计"])

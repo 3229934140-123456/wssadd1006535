@@ -10,7 +10,8 @@ from models import (
 from schemas import (
     ClinicStats, CleaningRecordDetail, OverviewResponse, OverviewSummary,
     OverviewRankingItem, PatientAlertHistory, PatientActionHistory,
-    HighValueExportResponse, HighValueExportItem
+    HighValueExportResponse, HighValueExportItem,
+    TrendResponse, TrendDataPoint
 )
 from config import (
     HIGH_VALUE_PATIENT_TYPES,
@@ -221,9 +222,15 @@ class StatsService:
                     id=s.clinic_id,
                     name=s.clinic_name,
                     total_cleanings=s.total_cleanings,
+                    followed_up_count=s.followed_up_count,
+                    appointed_count=s.appointed_count,
                     followup_rate=s.followup_rate,
                     appointment_rate=s.appointment_rate,
                     overdue_count=s.overdue_count,
+                    unfollowup_count=s.unfollowup_count,
+                    unconverted_count=s.unconverted_count,
+                    high_value_overdue_count=s.high_value_overdue_count,
+                    alert_pending_count=s.alert_pending_count,
                     alert_count=s.alert_pending_count
                 )
                 for s in all_stats if s.total_cleanings > 0
@@ -232,23 +239,28 @@ class StatsService:
             reverse=True
         )
 
-        doctor_stats = self.get_doctor_stats(clinic_id, start_date, end_date)
-        if doctor_id:
-            doctor_stats = [d for d in doctor_stats if d["doctor_id"] == doctor_id]
+        doctor_stats = self.get_doctor_stats(clinic_id, start_date, end_date, doctor_id, patient_type)
         doctor_ranking = sorted(
             [
                 OverviewRankingItem(
                     id=d["doctor_id"],
                     name=d["doctor_name"],
                     total_cleanings=d["total_cleanings"],
+                    followed_up_count=d["followed_up_count"],
+                    appointed_count=d["appointed_count"],
                     followup_rate=d["followup_rate"],
                     appointment_rate=d["appointment_rate"],
-                    overdue_count=0,
-                    alert_count=0
+                    overdue_count=d["overdue_count"],
+                    unfollowup_count=d["unfollowup_count"],
+                    unconverted_count=d["unconverted_count"],
+                    high_value_overdue_count=d["high_value_overdue_count"],
+                    alert_pending_count=d["alert_pending_count"],
+                    alert_count=d["alert_pending_count"]
                 )
                 for d in doctor_stats if d["total_cleanings"] > 0
             ],
-            key=lambda x: x.followup_rate
+            key=lambda x: x.overdue_count,
+            reverse=True
         )
 
         patient_type_breakdown = []
@@ -295,11 +307,72 @@ class StatsService:
                 ).first():
                     appointed += 1
 
+            overdue_count_pt = 0
+            unfollowup_pt = 0
+            unconverted_pt = 0
+            high_value_pt = 0
+            alert_pending_pt = 0
+            today = date.today()
+            for r in pt_records:
+                threshold = get_followup_threshold(self.db, r.clinic_id)
+                threshold_date = today - timedelta(days=threshold)
+                has_followup = self.db.query(Followup).filter(
+                    Followup.cleaning_record_id == r.id
+                ).first() is not None
+                has_valid_appointment = self.db.query(Appointment).filter(
+                    and_(
+                        Appointment.cleaning_record_id == r.id,
+                        Appointment.status.in_(["待就诊", "已就诊"])
+                    )
+                ).first() is not None
+                if not has_followup and r.cleaning_date <= threshold_date:
+                    unfollowup_pt += 1
+                    overdue_count_pt += 1
+                if has_followup and not has_valid_appointment:
+                    symptomatic = self.db.query(Followup).filter(
+                        and_(
+                            Followup.cleaning_record_id == r.id,
+                            (Followup.has_bleeding == True) |
+                            (Followup.has_sensitivity == True) |
+                            (Followup.has_pain == True)
+                        )
+                    ).first()
+                    if symptomatic:
+                        unconverted_pt += 1
+                pt_obj = self.db.query(Patient).filter(Patient.id == r.patient_id).first()
+                if pt_obj and pt_obj.patient_type in HIGH_VALUE_PATIENT_TYPES:
+                    interval_days = get_interval_days(self.db, r.clinic_id, pt_obj.patient_type)
+                    hv_threshold = today - timedelta(days=interval_days)
+                    if r.cleaning_date <= hv_threshold and not has_valid_appointment:
+                        high_value_pt += 1
+                        overdue_count_pt += 1
+            pt_alert_query = self.db.query(Alert).filter(
+                Alert.status == "待处理"
+            ).join(CleaningRecord).join(Patient).filter(
+                Patient.patient_type == pt
+            )
+            if start_date:
+                pt_alert_query = pt_alert_query.filter(CleaningRecord.cleaning_date >= start_date)
+            if end_date:
+                pt_alert_query = pt_alert_query.filter(CleaningRecord.cleaning_date <= end_date)
+            if clinic_id:
+                pt_alert_query = pt_alert_query.filter(CleaningRecord.clinic_id == clinic_id)
+            if doctor_id:
+                pt_alert_query = pt_alert_query.filter(CleaningRecord.doctor_id == doctor_id)
+            alert_pending_pt = pt_alert_query.count()
+
             patient_type_breakdown.append({
                 "patient_type": pt,
                 "total_cleanings": total,
+                "followed_up_count": followed,
+                "appointed_count": appointed,
                 "followup_rate": round(followed / total * 100, 1) if total > 0 else 0.0,
                 "appointment_rate": round(appointed / total * 100, 1) if total > 0 else 0.0,
+                "overdue_count": overdue_count_pt,
+                "unfollowup_count": unfollowup_pt,
+                "unconverted_count": unconverted_pt,
+                "high_value_overdue_count": high_value_pt,
+                "alert_pending_count": alert_pending_pt,
             })
 
         return OverviewResponse(
@@ -405,14 +478,19 @@ class StatsService:
     def get_doctor_stats(
         self, clinic_id: Optional[int] = None,
         start_date: Optional[date] = None,
-        end_date: Optional[date] = None
+        end_date: Optional[date] = None,
+        doctor_id: Optional[int] = None,
+        patient_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         query = self.db.query(Doctor)
         if clinic_id:
             query = query.filter(Doctor.clinic_id == clinic_id)
+        if doctor_id:
+            query = query.filter(Doctor.id == doctor_id)
         doctors = query.all()
 
         result = []
+        today = date.today()
         for doctor in doctors:
             records_query = self.db.query(CleaningRecord).filter(
                 CleaningRecord.doctor_id == doctor.id
@@ -421,21 +499,78 @@ class StatsService:
                 records_query = records_query.filter(CleaningRecord.cleaning_date >= start_date)
             if end_date:
                 records_query = records_query.filter(CleaningRecord.cleaning_date <= end_date)
+            if patient_type:
+                records_query = records_query.join(Patient).filter(Patient.patient_type == patient_type)
             records = records_query.all()
 
             total = len(records)
             followed = 0
             appointed = 0
+            unfollowup_count = 0
+            unconverted_count = 0
+            high_value_overdue_count = 0
+            overdue_count = 0
+
             for r in records:
-                if self.db.query(Followup).filter(Followup.cleaning_record_id == r.id).first():
-                    followed += 1
-                if self.db.query(Appointment).filter(
+                threshold = get_followup_threshold(self.db, r.clinic_id)
+                threshold_date = today - timedelta(days=threshold)
+
+                has_followup = self.db.query(Followup).filter(
+                    Followup.cleaning_record_id == r.id
+                ).first() is not None
+
+                has_valid_appointment = self.db.query(Appointment).filter(
                     and_(
                         Appointment.cleaning_record_id == r.id,
                         Appointment.status.in_(["待就诊", "已就诊"])
                     )
-                ).first():
+                ).first() is not None
+
+                if has_followup:
+                    followed += 1
+                elif r.cleaning_date <= threshold_date:
+                    unfollowup_count += 1
+                    overdue_count += 1
+
+                if has_valid_appointment:
                     appointed += 1
+
+                if has_followup and not has_valid_appointment:
+                    symptomatic_followup = self.db.query(Followup).filter(
+                        and_(
+                            Followup.cleaning_record_id == r.id,
+                            (Followup.has_bleeding == True) |
+                            (Followup.has_sensitivity == True) |
+                            (Followup.has_pain == True)
+                        )
+                    ).first()
+                    if symptomatic_followup:
+                        unconverted_count += 1
+
+                pt = self.db.query(Patient).filter(Patient.id == r.patient_id).first()
+                if pt and pt.patient_type in HIGH_VALUE_PATIENT_TYPES:
+                    interval_days = get_interval_days(self.db, r.clinic_id, pt.patient_type)
+                    hv_threshold = today - timedelta(days=interval_days)
+                    if r.cleaning_date <= hv_threshold and not has_valid_appointment:
+                        high_value_overdue_count += 1
+                        overdue_count += 1
+
+            pending_alerts_query = self.db.query(Alert).filter(
+                and_(Alert.status == "待处理")
+            ).join(CleaningRecord).filter(
+                CleaningRecord.id == Alert.cleaning_record_id,
+                CleaningRecord.doctor_id == doctor.id
+            )
+            if start_date:
+                pending_alerts_query = pending_alerts_query.filter(CleaningRecord.cleaning_date >= start_date)
+            if end_date:
+                pending_alerts_query = pending_alerts_query.filter(CleaningRecord.cleaning_date <= end_date)
+            if patient_type:
+                pending_alerts_query = pending_alerts_query.join(Patient).filter(
+                    Patient.id == CleaningRecord.patient_id,
+                    Patient.patient_type == patient_type
+                )
+            alert_pending_count = pending_alerts_query.count()
 
             result.append({
                 "doctor_id": doctor.id,
@@ -447,6 +582,11 @@ class StatsService:
                 "followup_rate": round(followed / total * 100, 1) if total > 0 else 0.0,
                 "appointed_count": appointed,
                 "appointment_rate": round(appointed / total * 100, 1) if total > 0 else 0.0,
+                "overdue_count": overdue_count,
+                "unfollowup_count": unfollowup_count,
+                "unconverted_count": unconverted_count,
+                "high_value_overdue_count": high_value_overdue_count,
+                "alert_pending_count": alert_pending_count,
             })
         return result
 
@@ -557,7 +697,14 @@ class StatsService:
                 overdue_days=overdue_days,
                 alert_type=alert.alert_type,
                 alert_title=alert.title,
+                status=alert.status,
                 responsible_person=alert.responsible_person,
+                assignee=alert.assignee,
+                deadline=alert.deadline,
+                resolved_by=alert.resolved_by,
+                resolved_at=alert.resolved_at,
+                resolved_detail=alert.resolved_detail,
+                auto_resolved=alert.auto_resolved,
                 last_followup_time=latest_followup.followup_time if latest_followup else None,
                 last_followup_content=latest_followup.patient_feedback if latest_followup else None
             ))
@@ -570,4 +717,168 @@ class StatsService:
             high_value_count=high_value_count,
             unconverted_count=unconverted_count,
             items=items
+        )
+
+    def get_trend(
+        self,
+        period_type: str = "day",
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        clinic_id: Optional[int] = None,
+        compare_clinic: bool = False
+    ) -> TrendResponse:
+        today = date.today()
+        if end_date:
+            end_date = min(end_date, today)
+        else:
+            end_date = today
+        if not start_date:
+            if period_type == "day":
+                start_date = end_date - timedelta(days=13)
+            else:
+                start_date = end_date - timedelta(days=41)
+        else:
+            start_date = min(start_date, end_date)
+
+        periods = []
+        current = start_date
+        if period_type == "day":
+            while current <= end_date:
+                periods.append((current, current, current))
+                current += timedelta(days=1)
+        else:
+            while current <= end_date:
+                week_end = min(current + timedelta(days=6), end_date)
+                periods.append((current, current, week_end))
+                current = week_end + timedelta(days=1)
+
+        data_points = []
+        by_clinic_data = {}
+
+        clinics_for_compare = []
+        if compare_clinic:
+            q = self.db.query(Clinic)
+            if clinic_id:
+                q = q.filter(Clinic.id == clinic_id)
+            clinics_for_compare = q.all()
+            for c in clinics_for_compare:
+                by_clinic_data[c.id] = []
+
+        for period_start, display_start, period_end in periods:
+            if period_type == "day":
+                period_label = period_start.strftime("%Y-%m-%d")
+            else:
+                period_label = f"{period_start.strftime('%m-%d')}~{period_end.strftime('%m-%d')}"
+
+            overall_query = self.db.query(Alert)
+            if clinic_id:
+                overall_query = overall_query.filter(Alert.clinic_id == clinic_id)
+
+            created_alerts = overall_query.filter(
+                func.date(Alert.created_at) >= period_start,
+                func.date(Alert.created_at) <= period_end
+            ).count()
+
+            resolved_alerts_query = overall_query.filter(
+                Alert.resolved_at.isnot(None)
+            ).filter(
+                func.date(Alert.resolved_at) >= period_start,
+                func.date(Alert.resolved_at) <= period_end
+            )
+            resolved_count = resolved_alerts_query.count()
+            auto_resolved_count = overall_query.filter(
+                Alert.auto_resolved == True,
+                Alert.resolved_at.isnot(None)
+            ).filter(
+                func.date(Alert.resolved_at) >= period_start,
+                func.date(Alert.resolved_at) <= period_end
+            ).count()
+
+            resolve_hours_list = []
+            for a in overall_query.filter(
+                Alert.resolved_at.isnot(None)
+            ).filter(
+                func.date(Alert.resolved_at) >= period_start,
+                func.date(Alert.resolved_at) <= period_end
+            ).all():
+                delta = a.resolved_at - a.created_at
+                resolve_hours_list.append(delta.total_seconds() / 3600)
+            avg_resolve_hours = round(sum(resolve_hours_list) / len(resolve_hours_list), 1) if resolve_hours_list else 0.0
+
+            pending_count = overall_query.filter(
+                Alert.status == "待处理"
+            ).filter(
+                func.date(Alert.created_at) <= period_end
+            ).count()
+
+            dp = TrendDataPoint(
+                period=period_label,
+                start_date=display_start,
+                end_date=period_end,
+                new_alerts=created_alerts,
+                resolved_alerts=resolved_count,
+                auto_resolved_count=auto_resolved_count,
+                auto_resolve_rate=round(auto_resolved_count / resolved_count * 100, 1) if resolved_count > 0 else 0.0,
+                avg_resolve_hours=avg_resolve_hours,
+                pending_alerts=pending_count
+            )
+            data_points.append(dp)
+
+            if compare_clinic:
+                for c in clinics_for_compare:
+                    c_created = self.db.query(Alert).filter(
+                        Alert.clinic_id == c.id,
+                        func.date(Alert.created_at) >= period_start,
+                        func.date(Alert.created_at) <= period_end
+                    ).count()
+                    c_resolved_query = self.db.query(Alert).filter(
+                        Alert.clinic_id == c.id,
+                        Alert.resolved_at.isnot(None)
+                    ).filter(
+                        func.date(Alert.resolved_at) >= period_start,
+                        func.date(Alert.resolved_at) <= period_end
+                    )
+                    c_resolved = c_resolved_query.count()
+                    c_auto = self.db.query(Alert).filter(
+                        Alert.clinic_id == c.id,
+                        Alert.auto_resolved == True,
+                        Alert.resolved_at.isnot(None)
+                    ).filter(
+                        func.date(Alert.resolved_at) >= period_start,
+                        func.date(Alert.resolved_at) <= period_end
+                    ).count()
+                    c_hours = []
+                    for a in self.db.query(Alert).filter(
+                        Alert.clinic_id == c.id,
+                        Alert.resolved_at.isnot(None)
+                    ).filter(
+                        func.date(Alert.resolved_at) >= period_start,
+                        func.date(Alert.resolved_at) <= period_end
+                    ).all():
+                        delta = a.resolved_at - a.created_at
+                        c_hours.append(delta.total_seconds() / 3600)
+                    c_avg = round(sum(c_hours) / len(c_hours), 1) if c_hours else 0.0
+                    c_pending = self.db.query(Alert).filter(
+                        Alert.clinic_id == c.id,
+                        Alert.status == "待处理"
+                    ).filter(
+                        func.date(Alert.created_at) <= period_end
+                    ).count()
+                    by_clinic_data[c.id].append(TrendDataPoint(
+                        period=period_label,
+                        start_date=display_start,
+                        end_date=period_end,
+                        new_alerts=c_created,
+                        resolved_alerts=c_resolved,
+                        auto_resolved_count=c_auto,
+                        auto_resolve_rate=round(c_auto / c_resolved * 100, 1) if c_resolved > 0 else 0.0,
+                        avg_resolve_hours=c_avg,
+                        pending_alerts=c_pending
+                    ))
+
+        return TrendResponse(
+            period_type=period_type,
+            clinic_id=clinic_id,
+            data_points=data_points,
+            by_clinic=by_clinic_data if compare_clinic else None
         )
